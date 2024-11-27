@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- scriv-insert-here -->
 
+## CVRez uncommited
+
+- Added `CVAT_HOST` to trusted CSRF origins (<https://github.com/opencv/cvat/pull/6322>)
+
+
 <a id='changelog-2.21.1'></a>
 ## \[2.21.1\] - 2024-10-18
 
