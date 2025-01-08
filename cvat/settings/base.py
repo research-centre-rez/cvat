@@ -19,9 +19,9 @@ import mimetypes
 import os
 import sys
 import tempfile
+import urllib
 from datetime import timedelta
 from enum import Enum
-import urllib
 
 from attr.converters import to_bool
 from corsheaders.defaults import default_headers
@@ -74,7 +74,7 @@ def generate_secret_key():
 
 try:
     sys.path.append(BASE_DIR)
-    from keys.secret_key import SECRET_KEY # pylint: disable=unused-import
+    from keys.secret_key import SECRET_KEY  # pylint: disable=unused-import
 except ModuleNotFoundError:
     generate_secret_key()
     from keys.secret_key import SECRET_KEY
@@ -177,7 +177,9 @@ REST_AUTH = {
     'OLD_PASSWORD_FIELD_ENABLED': True,
 }
 
-if to_bool(os.getenv('CVAT_ANALYTICS', False)):
+ANALYTICS_ENABLED = to_bool(os.getenv('CVAT_ANALYTICS', False))
+
+if ANALYTICS_ENABLED:
     INSTALLED_APPS += ['cvat.apps.log_viewer']
 
 MIDDLEWARE = [
@@ -234,7 +236,7 @@ IAM_DEFAULT_ROLE = 'user'
 
 IAM_ADMIN_ROLE = 'admin'
 # Index in the list below corresponds to the priority (0 has highest priority)
-IAM_ROLES = [IAM_ADMIN_ROLE, 'business', 'user', 'worker']
+IAM_ROLES = [IAM_ADMIN_ROLE, 'user', 'worker']
 IAM_OPA_HOST = 'http://opa:8181'
 IAM_OPA_DATA_URL = f'{IAM_OPA_HOST}/v1/data'
 LOGIN_URL = 'rest_login'
@@ -274,6 +276,7 @@ class CVAT_QUEUES(Enum):
     QUALITY_REPORTS = 'quality_reports'
     ANALYTICS_REPORTS = 'analytics_reports'
     CLEANING = 'cleaning'
+    CHUNKS = 'chunks'
 
 redis_inmem_host = os.getenv('CVAT_REDIS_INMEM_HOST', 'localhost')
 redis_inmem_port = os.getenv('CVAT_REDIS_INMEM_PORT', 6379)
@@ -318,6 +321,10 @@ RQ_QUEUES = {
     CVAT_QUEUES.CLEANING.value: {
         **shared_queue_settings,
         'DEFAULT_TIMEOUT': '1h',
+    },
+    CVAT_QUEUES.CHUNKS.value: {
+        **shared_queue_settings,
+        'DEFAULT_TIMEOUT': '5m',
     },
 }
 
@@ -530,12 +537,6 @@ DATA_UPLOAD_MAX_MEMORY_SIZE = 100 * 1024 * 1024  # 100 MB
 DATA_UPLOAD_MAX_NUMBER_FIELDS = None   # this django check disabled
 DATA_UPLOAD_MAX_NUMBER_FILES = None
 
-RESTRICTIONS = {
-    # allow access to analytics component to users with business role
-    # otherwise, only the administrator has access
-    'analytics_visibility': True,
-}
-
 redis_ondisk_host = os.getenv('CVAT_REDIS_ONDISK_HOST', 'localhost')
 # The default port is not Redis's default port (6379).
 # This is so that a developer can run both in-mem Redis and on-disk Kvrocks on their machine
@@ -543,14 +544,20 @@ redis_ondisk_host = os.getenv('CVAT_REDIS_ONDISK_HOST', 'localhost')
 redis_ondisk_port = os.getenv('CVAT_REDIS_ONDISK_PORT', 6666)
 redis_ondisk_password = os.getenv('CVAT_REDIS_ONDISK_PASSWORD', '')
 
+# Sets the timeout for the expiration of data chunk in redis_ondisk
+CVAT_CHUNK_CACHE_TTL = 3600 * 24  # 1 day
+
+# Sets the timeout for the expiration of preview image in redis_ondisk
+CVAT_PREVIEW_CACHE_TTL = 3600 * 24 * 7  # 7 days
+
 CACHES = {
-   'default': {
+    'default': {
         'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
     },
     'media': {
-       'BACKEND' : 'django.core.cache.backends.redis.RedisCache',
-       "LOCATION": f"redis://:{urllib.parse.quote(redis_ondisk_password)}@{redis_ondisk_host}:{redis_ondisk_port}",
-       'TIMEOUT' : 3600 * 24, # 1 day
+        'BACKEND' : 'django.core.cache.backends.redis.RedisCache',
+        "LOCATION": f'redis://:{urllib.parse.quote(redis_ondisk_password)}@{redis_ondisk_host}:{redis_ondisk_port}',
+        'TIMEOUT' : CVAT_CHUNK_CACHE_TTL,
     }
 }
 
@@ -577,6 +584,8 @@ TUS_DEFAULT_CHUNK_SIZE = 104857600  # 100 mb
 # More about forwarded headers - https://doc.traefik.io/traefik/getting-started/faq/#what-are-the-forwarded-headers-when-proxying-http-requests
 # How django uses X-Forwarded-Proto - https://docs.djangoproject.com/en/2.2/ref/settings/#secure-proxy-ssl-header
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+
+SECURE_REFERRER_POLICY = 'strict-origin-when-cross-origin'
 
 # Forwarded host - https://docs.djangoproject.com/en/4.0/ref/settings/#std:setting-USE_X_FORWARDED_HOST
 # Is used in TUS uploads to provide correct upload endpoint
@@ -732,6 +741,7 @@ ONE_RUNNING_JOB_IN_QUEUE_PER_USER = to_bool(os.getenv('ONE_RUNNING_JOB_IN_QUEUE_
 CVAT_CONCURRENT_CHUNK_PROCESSING = int(os.getenv('CVAT_CONCURRENT_CHUNK_PROCESSING', 1))
 
 from cvat.rq_patching import update_started_job_registry_cleanup
+
 update_started_job_registry_cleanup()
 
 CLOUD_DATA_DOWNLOADING_MAX_THREADS_NUMBER = 4
