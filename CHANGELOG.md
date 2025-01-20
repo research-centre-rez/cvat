@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- scriv-insert-here -->
 
+## CVRez uncommited
+
+- Added `CVAT_HOST` to trusted CSRF origins (<https://github.com/opencv/cvat/pull/6322>)
+
 <a id='changelog-2.24.0'></a>
 ## \[2.24.0\] - 2024-12-20
 
@@ -279,7 +283,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Incorrect progress representation on `Requests` page
   (<https://github.com/cvat-ai/cvat/pull/8668>)
 
-<a id='changelog-2.21.3'></a>
+<a id='changelog-2.21.3'<<<<<<< fix/csrf-trusted-origin
+20
+ 
+></a>
 ## \[2.21.3\] - 2024-10-31
 
 ### Changed
