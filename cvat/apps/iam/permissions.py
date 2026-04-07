@@ -5,14 +5,13 @@
 
 from __future__ import annotations
 
-import importlib
 import operator
 from abc import ABCMeta, abstractmethod
-from collections.abc import Collection, Sequence
+from collections.abc import Sequence
 from enum import Enum
-from functools import cached_property, lru_cache
+from functools import cached_property, reduce
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, TypeAlias, TypeVar
 
 from attrs import define, field
 from django.apps import AppConfig
@@ -85,11 +84,11 @@ def get_membership(request, organization):
     ).first()
 
 
-IamContext = dict[str, Any]
+IamContext: TypeAlias = dict[str, Any]
 
 
 def build_iam_context(
-    request, organization: Optional[Organization], membership: Optional[Membership]
+    request, organization: Organization | None, membership: Membership | None
 ) -> IamContext:
     return {
         "user_id": request.user.id,
@@ -242,33 +241,32 @@ class OpenPolicyAgentPermission(metaclass=ABCMeta):
         with make_requests_session() as session:
             r = session.post(url, json=self.payload).json()["result"]
 
-        q_objects = []
-        ops_dict = {
+        binary_ops_dict = {
             "|": operator.or_,
             "&": operator.and_,
-            "~": operator.not_,
         }
-        for item in r:
-            if isinstance(item, str):
-                val1 = q_objects.pop()
-                if item == "~":
-                    q_objects.append(ops_dict[item](val1))
-                else:
-                    val2 = q_objects.pop()
-                    q_objects.append(ops_dict[item](val1, val2))
-            else:
-                q_objects.append(Q(**item))
 
-        if q_objects:
-            assert len(q_objects) == 1
-        else:
-            q_objects.append(Q())
+        def parse_filter(expr):
+            match expr:
+                case ["~", arg]:
+                    return ~parse_filter(arg)
+                case [op, *args]:
+                    return reduce(binary_ops_dict[op], map(parse_filter, args))
+                case {} if not expr:
+                    # Empty Q() exhibits some bizarre behavior when used in expressions
+                    # (e.g. ~Q() works the same as Q()), so we use this as a more predictable
+                    # "always true" filter.
+                    return ~Q(pk__in=[])
+                case {}:
+                    return Q(**expr)
+                case _:
+                    assert False, "unknown expression type"
 
         # By default, a QuerySet will not eliminate duplicate rows. If your
         # query spans multiple tables (e.g. members__user_id, owner_id), it's
         # possible to get duplicate results when a QuerySet is evaluated.
         # That's when you'd use distinct().
-        return queryset.filter(q_objects[0]).distinct()
+        return queryset.filter(parse_filter(r)).distinct()
 
     @classmethod
     def get_per_field_update_scopes(cls, request, scopes_per_field):
@@ -300,15 +298,6 @@ def is_public_obj(obj: T) -> bool:
 
 
 class PolicyEnforcer(BasePermission):
-    @lru_cache(maxsize=1, typed=True)
-    def _collect_permission_types(self) -> Collection[type[OpenPolicyAgentPermission]]:
-        def get_subclasses(cls):
-            return set(cls.__subclasses__()).union(
-                s for c in cls.__subclasses__() for s in get_subclasses(c)
-            )
-
-        return get_subclasses(OpenPolicyAgentPermission)
-
     def _check_permission(
         self, request: ExtendedRequest, view: ViewSet, obj
     ) -> tuple[bool, list[OpenPolicyAgentPermission]]:
@@ -321,13 +310,18 @@ class PolicyEnforcer(BasePermission):
             if self.is_metadata_request(request, view) or obj and is_public_obj(obj):
                 return True
 
+            assert hasattr(
+                view, "iam_permission_class"
+            ), f"View {view} has no 'iam_permission_class' attribute"
+
+            perm_class = view.iam_permission_class
             iam_context = get_iam_context(request, obj)
-            for perm_class in self._collect_permission_types():
-                for perm in perm_class.create(request, view, obj, iam_context=iam_context):
-                    checked_permissions.append(perm)
-                    result = perm.check_access()
-                    if not result.allow:
-                        return False
+
+            for perm in perm_class.create(request, view, obj, iam_context=iam_context):
+                checked_permissions.append(perm)
+                result = perm.check_access()
+                if not result.allow:
+                    return False
 
             return True
 
@@ -362,18 +356,11 @@ class IsAuthenticatedOrReadPublicResource(BasePermission):
         )
 
 
-def load_app_permissions(config: AppConfig) -> None:
+def load_app_iam_rules(config: AppConfig) -> None:
     """
-    Ensures that permissions and OPA rules from the given app are loaded.
+    Ensures that OPA rules from the given app are loaded.
 
     This function should be called from the AppConfig.ready() method of every
-    app that defines a permissions module.
+    app that defines OPA rules.
     """
-    permissions_module = importlib.import_module(config.name + ".permissions")
-
-    assert any(
-        isinstance(attr, type) and issubclass(attr, OpenPolicyAgentPermission)
-        for attr in vars(permissions_module).values()
-    )
-
     add_opa_rules_path(Path(config.path, "rules"))

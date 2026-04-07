@@ -4,7 +4,6 @@
 // SPDX-License-Identifier: MIT
 
 import FormData from 'form-data';
-import store from 'store';
 import Axios, { AxiosError, AxiosResponse } from 'axios';
 import * as tus from 'tus-js-client';
 import { ChunkQuality } from 'cvat-data';
@@ -14,15 +13,16 @@ import { axiosTusHttpStack } from './axios-tus';
 import {
     SerializedLabel, SerializedAnnotationFormats, ProjectsFilter,
     SerializedProject, SerializedTask, TasksFilter, SerializedUser, SerializedOrganization,
-    SerializedAbout, SerializedRemoteFile, SerializedUserAgreement,
+    SerializedAbout, SerializedRemoteFile, SerializedUserAgreement, SerializedFunctionRequest,
     SerializedRegister, JobsFilter, SerializedJob, SerializedGuide, SerializedAsset, SerializedAPISchema,
     SerializedInvitationData, SerializedCloudStorage, SerializedFramesMetaData, SerializedCollection,
     SerializedQualitySettingsData, APIQualitySettingsFilter, SerializedQualityConflictData, APIQualityConflictsFilter,
     SerializedQualityReportData, APIQualityReportsFilter, APIAnalyticsEventsFilter, APIConsensusSettingsFilter,
     SerializedRequest, SerializedJobValidationLayout, SerializedTaskValidationLayout, SerializedConsensusSettingsData,
+    SerializedApiToken, APIApiTokensFilter,
 } from './server-response-types';
-import { PaginatedResource, UpdateStatusData } from './core-types';
-import { Request } from './request';
+import { APIApiTokenModifiableFields } from './server-request-types';
+import { PaginatedResource, SerializedModel, UpdateStatusData } from './core-types';
 import { Storage } from './storage';
 import { SerializedEvent } from './event';
 import { RQStatus, StorageLocation, WebhookSourceType } from './enums';
@@ -57,63 +57,45 @@ function configureStorage(storage: Storage, useDefaultLocation = false): Partial
     };
 }
 
-function fetchAll(url, filter = {}): Promise<any> {
+function fetchAll<T extends { id: number | string }>(url, filter = {}): Promise<{ count: number; results: T[] }> {
     const pageSize = 500;
     const result = {
         count: 0,
-        results: [],
+        results: new Map<T['id'], T>(),
     };
-    return new Promise((resolve, reject) => {
-        Axios.get(url, {
-            params: {
-                ...filter,
-                page_size: pageSize,
-                page: 1,
-            },
-        }).then((initialData) => {
-            const { count, results } = initialData.data;
-            result.results = result.results.concat(results);
-            result.count = result.results.length;
 
-            if (count <= pageSize) {
-                resolve(result);
-                return;
+    function appendToResult(data: { count: number; results: T[] }): { hasMore: boolean; } {
+        result.count = data.count;
+        data.results.forEach((obj: T) => {
+            if (!result.results.has(obj.id)) {
+                result.results.set(obj.id, obj);
             }
+        });
+        return { hasMore: result.count > result.results.size };
+    }
 
-            const pages = Math.ceil(count / pageSize);
-            const promises = Array(pages).fill(0).map((_: number, i: number) => {
-                if (i) {
-                    return Axios.get(url, {
-                        params: {
-                            ...filter,
-                            page_size: pageSize,
-                            page: i + 1,
-                        },
+    return new Promise((resolve, reject) => {
+        const fetchPage = (page: number) => {
+            Axios.get(url, {
+                params: {
+                    ...filter,
+                    page_size: pageSize,
+                    page,
+                },
+            }).then((response) => {
+                const { hasMore } = appendToResult(response.data);
+                if (hasMore) {
+                    fetchPage(page + 1);
+                } else {
+                    resolve({
+                        count: result.count,
+                        results: [...result.results.values()],
                     });
                 }
-
-                return Promise.resolve(null);
-            });
-
-            Promise.all(promises).then((responses: AxiosResponse<any, any>[]) => {
-                responses.forEach((resp) => {
-                    if (resp) {
-                        result.results = result.results.concat(resp.data.results);
-                    }
-                });
-
-                // removing possible duplicates
-                const obj = result.results.reduce((acc: Record<string, any>, item: any) => {
-                    acc[item.id] = item;
-                    return acc;
-                }, {});
-
-                result.results = Object.values(obj);
-                result.count = result.results.length;
-
-                resolve(result);
             }).catch((error) => reject(error));
-        }).catch((error) => reject(error));
+        };
+
+        fetchPage(1);
     });
 }
 
@@ -140,8 +122,8 @@ async function chunkUpload(file: File, uploadConfig): Promise<{ uploadSentSize: 
 
                     // do not retry if (code >= 400 && code < 500) is default tus behaviour
                     // retry if code === 409 or 423 is default tus behaviour
-                    // additionally handle codes 429 and 0
-                    return !(code >= 400 && code < 500) || [409, 423, 429, 0].includes(code);
+                    // additionally handle code 0
+                    return !(code >= 400 && code < 500) || [409, 423, 0].includes(code);
                 }
 
                 return false;
@@ -353,7 +335,7 @@ Axios.interceptors.request.use((reqConfig) => {
 });
 
 Axios.interceptors.response.use((response) => {
-    if (isResourceURL(response.config.url) &&
+    if (isResourceURL(response.config.url) && response.config.method === 'get' &&
         'organization' in (response.data || {})
     ) {
         const newOrgId: number | null = response.data.organization;
@@ -364,11 +346,6 @@ Axios.interceptors.response.use((response) => {
 
     return response;
 });
-
-// Previously, we used to store an additional authentication token in local storage.
-// Now we don't, and if the user still has one stored, we'll remove it to prevent
-// unnecessary credential exposure.
-store.remove('token');
 
 function setAuthData(response: AxiosResponse): void {
     if (response.headers['set-cookie']) {
@@ -575,6 +552,63 @@ async function authenticated(): Promise<boolean> {
     return true;
 }
 
+async function getApiTokens(filter: APIApiTokensFilter = {}): Promise<PaginatedResource<SerializedRequest>> {
+    const { backendAPI } = config;
+
+    let response = null;
+    try {
+        response = await Axios.get(`${backendAPI}/auth/access_tokens`, {
+            params: {
+                ...filter,
+            },
+        });
+    } catch (errorData) {
+        throw generateError(errorData);
+    }
+
+    response.data.results.count = response.data.count;
+    return response.data.results;
+}
+
+async function createApiToken(tokenData: SerializedApiToken): Promise<SerializedApiToken> {
+    const { backendAPI } = config;
+
+    let response = null;
+    try {
+        response = await Axios.post(`${backendAPI}/auth/access_tokens`, tokenData);
+    } catch (errorData) {
+        throw generateError(errorData);
+    }
+
+    return response.data;
+}
+
+async function updateApiToken(
+    id: number,
+    tokenData: APIApiTokenModifiableFields,
+): Promise<SerializedApiToken> {
+    const { backendAPI } = config;
+
+    let response = null;
+    try {
+        response = await Axios.patch(`${backendAPI}/auth/access_tokens/${id}`, tokenData);
+    } catch (errorData) {
+        throw generateError(errorData);
+    }
+
+    return response.data;
+}
+
+async function revokeApiToken(id: number): Promise<void> {
+    const { backendAPI } = config;
+
+    try {
+        await Axios.delete(`${backendAPI}/auth/access_tokens/${id}`);
+    } catch (errorData) {
+        throw generateError(errorData);
+    }
+}
+
 async function healthCheck(
     maxRetries: number,
     checkPeriod: number,
@@ -623,9 +657,8 @@ async function getRequestsList(): Promise<PaginatedResource<SerializedRequest>> 
     const params = enableOrganization();
 
     try {
-        const response = await fetchAll(`${backendAPI}/requests`, params);
-
-        return response.results;
+        const response = await fetchAll<SerializedRequest>(`${backendAPI}/requests`, params);
+        return Object.assign(response.results, { count: response.count });
     } catch (errorData) {
         throw generateError(errorData);
     }
@@ -778,7 +811,7 @@ async function getTasks(
     try {
         if (aggregate) {
             response = {
-                data: await fetchAll(`${backendAPI}/tasks`, {
+                data: await fetchAll<SerializedTask>(`${backendAPI}/tasks`, {
                     ...filter,
                     ...enableOrganization(),
                 }),
@@ -864,7 +897,7 @@ async function getLabels(filter: {
     project_id?: number,
 }): Promise<{ results: SerializedLabel[] }> {
     const { backendAPI } = config;
-    return fetchAll(`${backendAPI}/labels`, {
+    return fetchAll<SerializedLabel & { id: number }>(`${backendAPI}/labels`, {
         ...filter,
         ...enableOrganization(),
     });
@@ -995,12 +1028,14 @@ async function backupTask(
     targetStorage: Storage,
     useDefaultSettings: boolean,
     fileName?: string,
+    lightweight?: boolean,
 ): Promise<string | void> {
     const { backendAPI } = config;
     const params: Params = {
         ...enableOrganization(),
         ...configureStorage(targetStorage, useDefaultSettings),
         ...(fileName ? { filename: fileName } : {}),
+        ...(typeof lightweight === 'boolean' ? { lightweight } : {}),
     };
     const url = `${backendAPI}/tasks/${id}/backup/export`;
 
@@ -1075,6 +1110,7 @@ async function backupProject(
     targetStorage: Storage,
     useDefaultSettings: boolean,
     fileName?: string,
+    lightweight?: boolean,
 ): Promise<string | void> {
     const { backendAPI } = config;
     // keep current default params to 'freeze" them during this request
@@ -1082,6 +1118,7 @@ async function backupProject(
         ...enableOrganization(),
         ...configureStorage(targetStorage, useDefaultSettings),
         ...(fileName ? { filename: fileName } : {}),
+        ...(typeof lightweight === 'boolean' ? { lightweight } : {}),
     };
 
     const url = `${backendAPI}/projects/${id}/backup/export`;
@@ -1155,7 +1192,7 @@ async function restoreProject(storage: Storage, file: File | string): Promise<st
 async function createTask(
     taskSpec: Partial<SerializedTask>,
     taskDataSpec: any,
-    onUpdate: (request: Request | UpdateStatusData) => void,
+    onUpdate: (updateData: UpdateStatusData) => void,
 ): Promise<{ taskID: number, rqID: string }> {
     const { backendAPI, origin } = config;
     // keep current default params to 'freeze" them during this request
@@ -1308,7 +1345,7 @@ async function getJobs(
 
         if (aggregate) {
             response = {
-                data: await fetchAll(`${backendAPI}/jobs`, {
+                data: await fetchAll<SerializedJob>(`${backendAPI}/jobs`, {
                     ...filter,
                     ...enableOrganization(),
                 }),
@@ -1500,6 +1537,19 @@ async function getUsers(filter = { page_size: 'all' }): Promise<SerializedUser[]
     }
 
     return response.data.results;
+}
+
+async function updateUser(id: number, userData: Partial<SerializedUser>): Promise<SerializedUser> {
+    const { backendAPI } = config;
+
+    let response = null;
+    try {
+        response = await Axios.patch(`${backendAPI}/users/${id}`, userData);
+    } catch (errorData) {
+        throw generateError(errorData);
+    }
+
+    return response.data;
 }
 
 function getPreview(instance: 'projects' | 'tasks' | 'jobs' | 'cloudstorages' | 'functions') {
@@ -1773,11 +1823,17 @@ function exportEvents(params: APIAnalyticsEventsFilter): Promise<string> {
     return promise;
 }
 
-async function getLambdaFunctions() {
+async function getLambdaFunctions(): Promise<SerializedModel[]> {
     const { backendAPI } = config;
 
+    const url = `${backendAPI}/lambda/functions`;
     try {
-        const response = await Axios.get(`${backendAPI}/lambda/functions`);
+        const head = await Axios.head(url, { validateStatus: (status) => status === 200 || status === 404 });
+        if (head.status === 404) {
+            return [];
+        }
+
+        const response = await Axios.get(url);
         return response.data;
     } catch (errorData) {
         if (errorData.response.status === 503) {
@@ -1787,7 +1843,7 @@ async function getLambdaFunctions() {
     }
 }
 
-async function runLambdaRequest(body) {
+async function runLambdaRequest(body): Promise<SerializedFunctionRequest> {
     const { backendAPI } = config;
 
     try {
@@ -1811,7 +1867,7 @@ async function callLambdaFunction(funId, body) {
     }
 }
 
-async function getLambdaRequests() {
+async function getLambdaRequests(): Promise<SerializedFunctionRequest[]> {
     const { backendAPI } = config;
 
     try {
@@ -1961,13 +2017,14 @@ async function getOrganizations(filter) {
         response = await Axios.get(`${backendAPI}/organizations`, {
             params: {
                 ...filter,
+                page_size: filter.page_size || 10,
+                sort: filter.sort || 'slug',
             },
         });
     } catch (errorData) {
         throw generateError(errorData);
     }
-
-    return response.data.results;
+    return response.data;
 }
 
 async function createOrganization(data: SerializedOrganization): Promise<SerializedOrganization> {
@@ -2280,10 +2337,12 @@ async function getQualitySettings(
     try {
         if (aggregate) {
             response = {
-                data: await fetchAll(`${backendAPI}/quality/settings`, {
-                    ...filter,
-                    ...enableOrganization(),
-                }),
+                data: await fetchAll<SerializedQualitySettingsData & { id: number }>(
+                    `${backendAPI}/quality/settings`, {
+                        ...filter,
+                        ...enableOrganization(),
+                    },
+                ),
             };
         } else {
             response = await Axios.get(`${backendAPI}/quality/settings`, {
@@ -2361,10 +2420,12 @@ async function getQualityConflicts(
     const { backendAPI } = config;
 
     try {
-        const response = await fetchAll(`${backendAPI}/quality/conflicts`, {
-            ...params,
-            ...filter,
-        });
+        const response = await fetchAll<SerializedQualityConflictData & { id: number }>(
+            `${backendAPI}/quality/conflicts`, {
+                ...params,
+                ...filter,
+            },
+        );
 
         return response.results;
     } catch (errorData) {
@@ -2382,10 +2443,12 @@ async function getQualityReports(
     try {
         if (aggregate) {
             response = {
-                data: await fetchAll(`${backendAPI}/quality/reports`, {
-                    ...filter,
-                    ...enableOrganization(),
-                }),
+                data: await fetchAll<SerializedQualityReportData & { id: number }>(
+                    `${backendAPI}/quality/reports`, {
+                        ...filter,
+                        ...enableOrganization(),
+                    },
+                ),
             };
         } else {
             response = await Axios.get(`${backendAPI}/quality/reports`, {
@@ -2404,7 +2467,6 @@ async function getQualityReports(
 
 export default Object.freeze({
     server: Object.freeze({
-        setAuthData,
         about,
         share,
         formats,
@@ -2468,6 +2530,14 @@ export default Object.freeze({
     users: Object.freeze({
         get: getUsers,
         self: getSelf,
+        update: updateUser,
+    }),
+
+    apiTokens: Object.freeze({
+        get: getApiTokens,
+        create: createApiToken,
+        update: updateApiToken,
+        revoke: revokeApiToken,
     }),
 
     frames: Object.freeze({

@@ -30,6 +30,7 @@ import ExportBackupModal from 'components/export-backup/export-backup-modal';
 import ImportDatasetModal from 'components/import-dataset/import-dataset-modal';
 import ImportBackupModal from 'components/import-backup/import-backup-modal';
 import UploadFileStatusModal from 'components/common/upload-file-status-modal';
+import SelectCSUpdatingSchemeModal from 'components/update-linked-cs-modal/select-cs-updating-scheme-modal';
 
 import JobsPageComponent from 'components/jobs-page/jobs-page';
 import ModelsPageComponent from 'components/models-page/models-page';
@@ -83,6 +84,9 @@ import QualityControlPage from './quality-control/quality-control-page';
 import AnalyticsReportPage from './analytics-report/analytics-report-page';
 import ConsensusManagementPage from './consensus-management-page/consensus-management-page';
 import InvitationWatcher from './invitation-watcher/invitation-watcher';
+import SelectOrganizationModal from './select-organization-modal/select-organization-modal';
+import BulkProgress from './bulk-progress';
+import ProfilePageComponent from './profile-page/profile-page';
 
 interface CVATAppProps {
     loadFormats: () => void;
@@ -114,7 +118,6 @@ interface CVATAppProps {
     userAgreementsInitialized: boolean;
     notifications: NotificationsState;
     user: any;
-    isModelPluginActive: boolean;
     pluginComponents: PluginsState['components'];
     invitationsFetching: boolean;
     invitationsInitialized: boolean;
@@ -305,7 +308,6 @@ class CVATApplication extends React.PureComponent<CVATAppProps & RouteComponentP
             user,
             userAgreementsFetching,
             userAgreementsInitialized,
-            isModelPluginActive,
             invitationsInitialized,
             invitationsFetching,
             initInvitations,
@@ -353,7 +355,7 @@ class CVATApplication extends React.PureComponent<CVATAppProps & RouteComponentP
             return;
         }
 
-        if (user == null || !user.isVerified || !user.id) {
+        if (user == null || !user.isVerified || !user?.id) {
             return;
         }
 
@@ -369,7 +371,7 @@ class CVATApplication extends React.PureComponent<CVATAppProps & RouteComponentP
             initRequests();
         }
 
-        if (isModelPluginActive && !modelsInitialized && !modelsFetching) {
+        if (!modelsInitialized && !modelsFetching) {
             initModels();
         }
 
@@ -384,7 +386,6 @@ class CVATApplication extends React.PureComponent<CVATAppProps & RouteComponentP
 
     private showMessages(): void {
         const { notifications, resetMessages, history } = this.props;
-
         function showMessage(notificationState: NotificationState): void {
             notification.info({
                 message: (
@@ -393,7 +394,8 @@ class CVATApplication extends React.PureComponent<CVATAppProps & RouteComponentP
                 description: notificationState?.description && (
                     <CVATMarkdown history={history}>{notificationState?.description}</CVATMarkdown>
                 ),
-                duration: notificationState.duration || null,
+                duration: notificationState.duration ?? null,
+                className: notificationState.className,
             });
         }
 
@@ -451,12 +453,11 @@ class CVATApplication extends React.PureComponent<CVATAppProps & RouteComponentP
             for (const what of Object.keys((notifications as any).errors[where])) {
                 const error = (notifications as any).errors[where][what] as ErrorState;
                 shown = shown || !!error;
-                if (error) {
+                if (error && !error.ignore) {
                     showError(error.message, error.reason, error.shouldLog, error.className);
                 }
             }
         }
-
         if (shown) {
             resetErrors();
         }
@@ -484,7 +485,6 @@ class CVATApplication extends React.PureComponent<CVATAppProps & RouteComponentP
             pluginComponents,
             user,
             location,
-            isModelPluginActive,
             isPasswordResetEnabled,
             isRegistrationEnabled,
         } = this.props;
@@ -500,7 +500,7 @@ class CVATApplication extends React.PureComponent<CVATAppProps & RouteComponentP
                 pluginsInitialized &&
                 aboutInitialized &&
                 organizationInitialized &&
-                (!isModelPluginActive || modelsInitialized)
+                modelsInitialized
             )
         );
 
@@ -562,20 +562,19 @@ class CVATApplication extends React.PureComponent<CVATAppProps & RouteComponentP
                                         <Route exact path='/invitations' component={InvitationsPage} />
                                         <Route exact path='/organization' component={OrganizationPage} />
                                         <Route exact path='/requests' component={RequestsPage} />
+                                        <Route exact path='/profile' component={ProfilePageComponent} />
                                         { routesToRender }
-                                        {isModelPluginActive && (
-                                            <Route
-                                                path='/models'
-                                            >
-                                                <Switch>
-                                                    <Route exact path='/models' component={ModelsPageComponent} />
-                                                </Switch>
-                                            </Route>
-                                        )}
+                                        <Route
+                                            path='/models'
+                                        >
+                                            <Switch>
+                                                <Route exact path='/models' component={ModelsPageComponent} />
+                                            </Switch>
+                                        </Route>
                                         <Redirect
                                             push
                                             to={{
-                                                pathname: queryParams.get('next') || '/tasks',
+                                                pathname: queryParams.get('next') ?? '/tasks',
                                                 search: authParams ? new URLSearchParams(authParams).toString() : '',
                                             }}
                                         />
@@ -586,6 +585,9 @@ class CVATApplication extends React.PureComponent<CVATAppProps & RouteComponentP
                                     <ImportBackupModal />
                                     <InvitationWatcher />
                                     <UploadFileStatusModal />
+                                    <SelectCSUpdatingSchemeModal />
+                                    <SelectOrganizationModal />
+                                    <BulkProgress />
                                     {/* eslint-disable-next-line */}
                                     <a id='downloadAnchor' target='_blank' style={{ display: 'none' }} download />
                                 </Layout.Content>

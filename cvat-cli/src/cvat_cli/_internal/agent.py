@@ -13,14 +13,18 @@ import secrets
 import shutil
 import tempfile
 import threading
-from collections.abc import Generator, Iterator, Sequence
+import time
+from collections import OrderedDict
+from collections.abc import Callable, Generator, Iterator, Sequence
 from datetime import datetime, timedelta, timezone
+from http import HTTPStatus
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 import attrs
 import cvat_sdk.auto_annotation as cvataa
 import cvat_sdk.datasets as cvatds
+import PIL.Image
 import urllib3.exceptions
 from cvat_sdk import Client, models
 from cvat_sdk.auto_annotation.driver import (
@@ -38,6 +42,7 @@ if TYPE_CHECKING:
 
 FUNCTION_PROVIDER_NATIVE = "native"
 FUNCTION_KIND_DETECTOR = "detector"
+FUNCTION_KIND_TRACKER = "tracker"
 REQUEST_CATEGORY_BATCH = "batch"
 REQUEST_CATEGORY_INTERACTIVE = "interactive"
 
@@ -46,8 +51,25 @@ REQUEST_CATEGORIES_WITH_DECREASING_PRIORITY = (REQUEST_CATEGORY_INTERACTIVE, REQ
 _POLLING_INTERVAL_MEAN_FREQUENT = timedelta(seconds=60)
 _POLLING_INTERVAL_MEAN_RARE = timedelta(minutes=10)
 _JITTER_AMOUNT = 0.15
+_DEFAULT_RETRY_DELAY = timedelta(seconds=5)
 
 _UPDATE_INTERVAL = timedelta(seconds=30)
+
+_MAX_AGE_OF_TRACKING_STATE = timedelta(hours=8)
+
+
+class _ExponentialBackoff:
+    def __init__(self, max_delay: timedelta, current_delay: timedelta) -> None:
+        self._max_delay = max_delay
+        self._current_delay = current_delay
+
+    def reset(self, current_delay: timedelta) -> None:
+        self._current_delay = current_delay
+
+    def next(self) -> timedelta:
+        delay = self._current_delay
+        self._current_delay = min(self._current_delay * 2, self._max_delay)
+        return delay
 
 
 class _RecoverableExecutor:
@@ -85,20 +107,146 @@ class _RecoverableExecutor:
             raise
 
 
+_TrackingStateIdGenerator: TypeAlias = Callable[[], str]
+
+
+def _default_tracking_state_id_generator() -> str:
+    # This is defined as a separate function so that tests can monkeypatch it
+    # in order to get deterministic state IDs.
+    return secrets.token_urlsafe(32)
+
+
 _current_function: cvataa.AutoAnnotationFunction
+_tracking_states: _TrackingStateContainer
+_tracking_state_id_generator: _TrackingStateIdGenerator
 
 
-def _worker_init(function_loader: FunctionLoader):
+@attrs.define
+class _ExtendedTrackingState:
+    inner_state: Any  # the state produced by the AA function
+    original_shape_type: str
+    original_task_id: int
+    original_image_dims: tuple[int, int]
+    last_accessed_at: datetime = attrs.field(factory=lambda: datetime.now(tz=timezone.utc))
+
+
+class _TrackingStateContainer:
+    def __init__(self):
+        self._id_to_ext_state: OrderedDict[str, _ExtendedTrackingState] = OrderedDict()
+
+    def store(self, state: Any, shape_type: str, task_id: int, image_dims: tuple[int, int]) -> str:
+        state_id = _tracking_state_id_generator()
+        self._id_to_ext_state[state_id] = _ExtendedTrackingState(
+            inner_state=state,
+            original_shape_type=shape_type,
+            original_task_id=task_id,
+            original_image_dims=image_dims,
+        )
+        return state_id
+
+    def retrieve(self, state_id: str, task_id: int, image_dims: tuple[int, int]) -> Any:
+        ext_state = self._id_to_ext_state.get(state_id)
+
+        if not ext_state:
+            raise _BadArError(f"Tracking state {state_id!r} not found - possibly expired")
+
+        if ext_state.original_task_id != task_id:
+            # This is a defense-in-depth measure. State IDs are supposed to be unguessable,
+            # but even if an attacker manages to obtain one, they will not be able to use it
+            # to get any information about a task they don't have access to.
+            raise _BadArError(f"Tracking state {state_id!r} is not for task #{task_id}")
+
+        if image_dims != ext_state.original_image_dims:
+            raise _BadArError(f"Image sizes of the start frame and the current frame are different")
+
+        ext_state.last_accessed_at = datetime.now(tz=timezone.utc)
+        self._id_to_ext_state.move_to_end(state_id)
+
+        return ext_state.inner_state, ext_state.original_shape_type
+
+    def prune(self) -> None:
+        cutoff = datetime.now(tz=timezone.utc) - _MAX_AGE_OF_TRACKING_STATE
+
+        while (
+            self._id_to_ext_state
+            and next(iter(self._id_to_ext_state.values())).last_accessed_at < cutoff
+        ):
+            self._id_to_ext_state.popitem(last=False)
+
+
+def _worker_init(function_loader: FunctionLoader, state_id_generator):
     global _current_function
     _current_function = function_loader.load()
+
+    if isinstance(_current_function.spec, cvataa.TrackingFunctionSpec):
+        global _tracking_states
+        _tracking_states = _TrackingStateContainer()
+
+        global _tracking_state_id_generator
+        _tracking_state_id_generator = state_id_generator
 
 
 def _worker_job_get_function_spec():
     return _current_function.spec
 
 
-def _worker_job_detect(context, image):
+def _worker_job_detect(
+    context: _DetectionFunctionContextImpl, image: PIL.Image.Image
+) -> list[cvataa.DetectionAnnotation]:
     return _current_function.detect(context, image)
+
+
+def _worker_job_init_tracking(
+    task_id: int,
+    image: PIL.Image.Image,
+    shapes: list[cvataa.TrackableShape],
+) -> list[str]:
+    _tracking_states.prune()
+
+    if hasattr(_current_function, "preprocess_image"):
+        pp_image = _current_function.preprocess_image(_TrackingFunctionContextImpl(), image)
+    else:
+        pp_image = image
+
+    return [
+        _tracking_states.store(
+            state=_current_function.init_tracking_state(
+                _TrackingFunctionShapeContextImpl(original_shape_type=shape.type), pp_image, shape
+            ),
+            shape_type=shape.type,
+            task_id=task_id,
+            image_dims=image.size,
+        )
+        for shape in shapes
+    ]
+
+
+def _worker_job_track(
+    task_id: int, image: PIL.Image.Image, states: list[str]
+) -> list[cvataa.TrackableShape | None]:
+    _tracking_states.prune()
+
+    pp_image = _current_function.preprocess_image(_TrackingFunctionContextImpl(), image)
+
+    def track(state_id):
+        inner_state, original_shape_type = _tracking_states.retrieve(
+            state_id=state_id, task_id=task_id, image_dims=image.size
+        )
+
+        output_shape = _current_function.track(
+            _TrackingFunctionShapeContextImpl(original_shape_type=original_shape_type),
+            pp_image,
+            inner_state,
+        )
+
+        if output_shape and output_shape.type != original_shape_type:
+            raise cvataa.BadFunctionError(
+                f"function output shape of type {output_shape.type!r}, "
+                f"but original shape was of type {original_shape_type!r}"
+            )
+        return output_shape
+
+    return list(map(track, states))
 
 
 @attrs.frozen
@@ -181,7 +329,7 @@ class _TaskCacheLimiter:
 
 def _parse_event_stream(
     stream: SupportsReadline[bytes],
-) -> Iterator[Union[_Event, _NewReconnectionDelay]]:
+) -> Iterator[_Event | _NewReconnectionDelay]:
     # https://html.spec.whatwg.org/multipage/server-sent-events.html#event-stream-interpretation
 
     event_type = event_data = ""
@@ -232,6 +380,15 @@ class _IncompatibleFunctionError(Exception):
     pass
 
 
+class _TrackingFunctionContextImpl(cvataa.TrackingFunctionContext):
+    pass
+
+
+@attrs.frozen(kw_only=True)
+class _TrackingFunctionShapeContextImpl(cvataa.TrackingFunctionShapeContext):
+    original_shape_type: str
+
+
 class _Agent:
     def __init__(self, client: Client, executor: _RecoverableExecutor, function_id: int):
         self._rng = random.Random()  # nosec
@@ -274,7 +431,9 @@ class _Agent:
         # In this case, it doesn't make sense to continue trying to connect frequently,
         # although we should still be trying occasionally in case the error is transient.
         # Once we're successful, we'll rely on the server to set a new reconnection delay.
-        self._queue_reconnection_delay = _POLLING_INTERVAL_MEAN_RARE
+        self._queue_reconnection_delay = _ExponentialBackoff(
+            _POLLING_INTERVAL_MEAN_RARE, _POLLING_INTERVAL_MEAN_RARE
+        )
 
     def _validate_function_compatibility(self, remote_function: dict) -> None:
         function_id = remote_function["id"]
@@ -289,6 +448,9 @@ class _Agent:
             if isinstance(self._function_spec, cvataa.DetectionFunctionSpec):
                 self._validate_detection_function_compatibility(remote_function)
                 self._calculate_result_for_ar = self._calculate_result_for_detection_ar
+            elif isinstance(self._function_spec, cvataa.TrackingFunctionSpec):
+                self._validate_tracking_function_compatibility(remote_function)
+                self._calculate_result_for_ar = self._calculate_result_for_tracking_ar
             else:
                 raise CriticalError(
                     f"Unsupported function spec type: {type(self._function_spec).__name__}"
@@ -318,10 +480,10 @@ class _Agent:
                 self._validate_sublabel_compatibility(remote_sl, sl, sl_desc)
 
     def _validate_sublabel_compatibility(
-        self, remote_sl: dict, sl: Optional[models.Sublabel], sl_desc: str
+        self, remote_sl: dict, sl: models.Sublabel | None, sl_desc: str
     ):
         if not sl:
-            raise CriticalError(f"{sl_desc} is not supported.")
+            raise _IncompatibleFunctionError(f"{sl_desc} is not supported.")
 
         if remote_sl["type"] not in {"any", "unknown"} and remote_sl["type"] != sl.type:
             raise _IncompatibleFunctionError(
@@ -349,6 +511,18 @@ class _Agent:
                     f"{attr_desc} has values {remote_attr['values']!r},"
                     f" but the function object declares values {attr.values!r}."
                 )
+
+    def _validate_tracking_function_compatibility(self, remote_function: dict) -> None:
+        self._validate_remote_function_kind(remote_function, FUNCTION_KIND_TRACKER)
+
+        remote_supported_shape_types = frozenset(remote_function["supported_shape_types"])
+        unsupported = remote_supported_shape_types - self._function_spec.supported_shape_types
+
+        if unsupported:
+            raise _IncompatibleFunctionError(
+                "the function object does not support the following shape types: "
+                + ", ".join(map(repr, unsupported))
+            )
 
     def _validate_remote_function_kind(self, remote_function: dict, expected_kind: str) -> None:
         if remote_function["kind"] != expected_kind:
@@ -397,12 +571,7 @@ class _Agent:
     def _wait_before_reconnecting_to_queue(self):
         delay_multiplier = self._rng.uniform(1, 1 + _JITTER_AMOUNT)
         self._queue_watcher_should_stop.wait(
-            timeout=self._queue_reconnection_delay.total_seconds() * delay_multiplier
-        )
-
-        # Apply exponential backoff.
-        self._queue_reconnection_delay = min(
-            self._queue_reconnection_delay * 2, _POLLING_INTERVAL_MEAN_RARE
+            timeout=self._queue_reconnection_delay.next().total_seconds() * delay_multiplier
         )
 
     def _watch_queue(self) -> None:
@@ -438,10 +607,10 @@ class _Agent:
                     if isinstance(message, _Event):
                         self._dispatch_queue_event(message)
                     elif isinstance(message, _NewReconnectionDelay):
-                        self._queue_reconnection_delay = message.delay
+                        self._queue_reconnection_delay.reset(message.delay)
                         self._client.logger.info(
                             "New queue event stream reconnection delay is %fs",
-                            self._queue_reconnection_delay.total_seconds(),
+                            message.delay.total_seconds(),
                         )
                     else:
                         assert False, f"unexpected message type {type(message)}"
@@ -500,6 +669,7 @@ class _Agent:
                             # most users should not be affected. For the ones that are, shutdown
                             # will be broken, but everything else should still work fine.
                             # This should be revisited once we drop Python 3.9 support.
+                            # TODO: check in newer versions
                             self._queue_watch_response.shutdown()
 
                 watcher.join()
@@ -534,14 +704,7 @@ class _Agent:
         try:
             result = self._calculate_result_for_ar(ar_id, ar_params)
 
-            self._client.logger.info("Submitting result for AR %r...", ar_id)
-            self._client.api_client.call_api(
-                "/api/functions/queues/{queue_id}/requests/{request_id}/complete",
-                "POST",
-                path_params={"queue_id": f"function:{self._function_id}", "request_id": ar_id},
-                body={"agent_id": self._agent_id, **result},
-            )
-            self._client.logger.info("AR %r completed", ar_id)
+            self._complete_ar(ar_id, result)
         except Exception as ex:
             self._client.logger.error("Failed to process AR %r", ar_id, exc_info=True)
 
@@ -586,7 +749,45 @@ class _Agent:
             else:
                 self._client.logger.info("AR %r failed", ar_id)
 
-    def _poll_for_ar(self, category: str) -> Optional[dict]:
+    def _handle_retryable_post_error(self, ex: Exception, delay: _ExponentialBackoff) -> bool:
+        # Normally, urllib3 handles retries for HTTP requests,
+        # but it only does it for idempotent ones.
+        # So for POST requests that are safe to retry, we have to do it ourselves.
+        # This function must be called from an exception handler.
+        # It will return True if the operation should be retried,
+        # or False if the exception should be re-raised.
+
+        is_rate_limit = False
+        delay_sec = None
+
+        if isinstance(ex, ApiException):
+            try:
+                delay_sec = int(ex.headers["Retry-After"])
+            except (KeyError, ValueError):
+                pass
+
+            if ex.status == HTTPStatus.TOO_MANY_REQUESTS:
+                is_rate_limit = True
+            elif ex.status and 400 <= ex.status < 500:
+                # We did something wrong; no point in retrying.
+                return False
+
+        if delay_sec is None:
+            delay_multiplier = self._rng.uniform(1, 1 + _JITTER_AMOUNT)
+            delay_sec = delay.next().total_seconds() * delay_multiplier
+
+        if is_rate_limit:
+            self._client.logger.warning("Rate limited; will retry in %.2fs", delay_sec)
+        else:
+            self._client.logger.error(
+                "Request failed; will retry in %.2fs", delay_sec, exc_info=True
+            )
+        time.sleep(delay_sec)
+        return True
+
+    def _poll_for_ar(self, category: str) -> dict | None:
+        retry_delay = _ExponentialBackoff(_POLLING_INTERVAL_MEAN_RARE, _DEFAULT_RETRY_DELAY)
+
         while True:
             self._client.logger.info(
                 "Trying to acquire an annotation request of category %r...", category
@@ -600,12 +801,8 @@ class _Agent:
                 )
                 break
             except (urllib3.exceptions.HTTPError, ApiException) as ex:
-                if isinstance(ex, ApiException) and ex.status and 400 <= ex.status < 500:
-                    # We did something wrong; no point in retrying.
+                if not self._handle_retryable_post_error(ex, retry_delay):
                     raise
-
-                self._client.logger.error("Acquire request failed; will retry", exc_info=True)
-                self._wait_between_polls()
 
         response_data = json.loads(response.data)
         return response_data["ar_assignment"]
@@ -660,15 +857,16 @@ class _Agent:
 
         mapper = self._create_annotation_mapper_for_detection_ar(ar_params, ds.labels)
 
-        all_annotations = models.PatchedLabeledDataRequest(shapes=[])
+        all_annotations = models.PatchedLabeledDataRequest(tags=[], shapes=[])
 
         for sample_index, sample in enumerate(ds.samples):
             context = self._create_detection_function_context(ar_params, sample.frame_name)
-            shapes = self._executor.result(
+            annotations = self._executor.result(
                 self._executor.submit(_worker_job_detect, context, sample.media.load_image())
             )
 
-            mapper.validate_and_remap(shapes, sample.frame_index)
+            tags, shapes = mapper.validate_and_remap(annotations, sample.frame_index)
+            all_annotations.tags.extend(tags)
             all_annotations.shapes.extend(shapes)
 
             current_timestamp = datetime.now(tz=timezone.utc)
@@ -690,12 +888,62 @@ class _Agent:
 
         context = self._create_detection_function_context(ar_params, sample.frame_name)
 
-        shapes = self._executor.result(
+        annotations = self._executor.result(
             self._executor.submit(_worker_job_detect, context, sample.media.load_image())
         )
 
-        mapper.validate_and_remap(shapes, sample.frame_index)
-        return {"annotations": models.PatchedLabeledDataRequest(shapes=shapes)}
+        tags, shapes = mapper.validate_and_remap(annotations, sample.frame_index)
+        return {"annotations": models.PatchedLabeledDataRequest(tags=tags, shapes=shapes)}
+
+    def _calculate_result_for_tracking_ar(self, ar_id: str, ar_params) -> dict[str, Any]:
+        if ar_params["type"] == "init_tracking":
+            with self._task_cache_limiter.using_cache_for_task(
+                ar_params["task"], with_chunks=False
+            ):
+                return self._calculate_result_for_init_tracking_ar(ar_id, ar_params)
+        elif ar_params["type"] == "track":
+            with self._task_cache_limiter.using_cache_for_task(
+                ar_params["task"], with_chunks=False
+            ):
+                return self._calculate_result_for_track_ar(ar_id, ar_params)
+        else:
+            raise _BadArError(f"unsupported type: {ar_params['type']!r}")
+
+    def _calculate_result_for_init_tracking_ar(self, ar_id: str, ar_params) -> dict[str, Any]:
+        sample, _ = self._get_sample_from_ar_params(ar_params)
+
+        def convert_shape(shape: dict) -> cvataa.TrackableShape:
+            if shape["type"] not in self._function_spec.supported_shape_types:
+                raise _BadArError(f"Unsupported shape type {shape['type']!r}")
+            return cvataa.TrackableShape(type=shape["type"], points=shape["points"])
+
+        shapes = list(map(convert_shape, ar_params["shapes"]))
+
+        states = self._executor.result(
+            self._executor.submit(
+                _worker_job_init_tracking,
+                ar_params["task"],
+                sample.media.load_image(),
+                shapes,
+            )
+        )
+
+        return {"states": states}
+
+    def _calculate_result_for_track_ar(self, ar_id: str, ar_params) -> dict[str, Any]:
+        sample, _ = self._get_sample_from_ar_params(ar_params)
+
+        states = ar_params["states"]
+        shapes = self._executor.result(
+            self._executor.submit(
+                _worker_job_track, ar_params["task"], sample.media.load_image(), states
+            )
+        )
+
+        return {
+            "states": states,
+            "shapes": [attrs.asdict(shape) if shape else None for shape in shapes],
+        }
 
     def _get_sample_from_ar_params(self, ar_params):
         ds = cvatds.TaskDataset(
@@ -718,20 +966,59 @@ class _Agent:
         return sample, ds.labels
 
     def _update_ar(self, ar_id: str, progress: float) -> None:
-        self._client.logger.info("Updating AR %r progress to %.2f%%", ar_id, progress * 100)
-        self._client.api_client.call_api(
-            "/api/functions/queues/{queue_id}/requests/{request_id}/update",
-            "POST",
-            path_params={"queue_id": f"function:{self._function_id}", "request_id": ar_id},
-            body={"agent_id": self._agent_id, "progress": progress},
-        )
+        self._client.logger.info("Updating AR %r progress to %.2f%%...", ar_id, progress * 100)
+
+        try:
+            self._client.api_client.call_api(
+                "/api/functions/queues/{queue_id}/requests/{request_id}/update",
+                "POST",
+                path_params={"queue_id": f"function:{self._function_id}", "request_id": ar_id},
+                body={"agent_id": self._agent_id, "progress": progress},
+            )
+        except (urllib3.exceptions.HTTPError, ApiException):
+            # Updating the progress is not critical, so log and continue onwards.
+            self._client.logger.error("Failed to update AR %r progress", ar_id, exc_info=True)
+
+    def _complete_ar(self, ar_id: str, result: dict) -> None:
+        # It would be frustrating for the user if we calculate the result of an AR and then fail
+        # due to a transient error when submitting it, so we should retry at least a couple times.
+
+        delay = _ExponentialBackoff(_POLLING_INTERVAL_MEAN_RARE, _DEFAULT_RETRY_DELAY)
+        attempt_num = 0
+
+        while True:
+            self._client.logger.info("Submitting result for AR %r...", ar_id)
+            try:
+                self._client.api_client.call_api(
+                    "/api/functions/queues/{queue_id}/requests/{request_id}/complete",
+                    "POST",
+                    path_params={"queue_id": f"function:{self._function_id}", "request_id": ar_id},
+                    body={"agent_id": self._agent_id, **result},
+                )
+                break
+            except (urllib3.exceptions.HTTPError, ApiException) as ex:
+                if attempt_num >= 3:
+                    self._client.logger.error(
+                        "Exceeded maximum retries for submitting AR %r", ar_id
+                    )
+                    raise
+
+                if not self._handle_retryable_post_error(ex, delay):
+                    raise
+
+            attempt_num += 1
+
+        self._client.logger.info("AR %r completed", ar_id)
 
 
 def run_agent(
     client: Client, function_loader: FunctionLoader, function_id: int, *, burst: bool
 ) -> None:
     with (
-        _RecoverableExecutor(initializer=_worker_init, initargs=[function_loader]) as executor,
+        _RecoverableExecutor(
+            initializer=_worker_init,
+            initargs=[function_loader, _default_tracking_state_id_generator],
+        ) as executor,
         tempfile.TemporaryDirectory() as cache_dir,
     ):
         client.config.cache_dir = Path(cache_dir, "cache")

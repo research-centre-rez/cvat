@@ -12,7 +12,7 @@ import {
 } from 'reducers';
 import { OrientationVisibility } from 'cvat-canvas3d-wrapper';
 import { ImageFilter, ImageFilterAlias, SerializedImageFilter } from 'utils/image-processing';
-import GammaCorrection, { GammaFilterOptions } from 'utils/fabric-wrapper/gamma-correciton';
+import GammaCorrection, { GammaFilterOptions } from 'utils/fabric-wrapper/gamma-correction';
 import { resolveConflicts } from 'utils/conflict-detector';
 import { shortcutsActions } from './shortcuts-actions';
 
@@ -42,9 +42,10 @@ export enum SettingsActionTypes {
     CHANGE_SATURATION_LEVEL = 'CHANGE_SATURATION_LEVEL',
     SWITCH_AUTO_SAVE = 'SWITCH_AUTO_SAVE',
     CHANGE_AUTO_SAVE_INTERVAL = 'CHANGE_AUTO_SAVE_INTERVAL',
-    CHANGE_AAM_ZOOM_MARGIN = 'CHANGE_AAM_ZOOM_MARGIN',
+    CHANGE_FOCUSED_OBJECT_PADDING = 'CHANGE_FOCUSED_OBJECT_PADDING',
     CHANGE_DEFAULT_APPROX_POLY_THRESHOLD = 'CHANGE_DEFAULT_APPROX_POLY_THRESHOLD',
     SWITCH_AUTOMATIC_BORDERING = 'SWITCH_AUTOMATIC_BORDERING',
+    SWITCH_SNAP_TO_POINT = 'SWITCH_SNAP_TO_POINT',
     SWITCH_ADAPTIVE_ZOOM = 'SWITCH_ADAPTIVE_ZOOM',
     SWITCH_INTELLIGENT_POLYGON_CROP = 'SWITCH_INTELLIGENT_POLYGON_CROP',
     SWITCH_SHOWNIG_INTERPOLATED_TRACKS = 'SWITCH_SHOWNIG_INTERPOLATED_TRACKS',
@@ -296,11 +297,11 @@ export function changeAutoSaveInterval(autoSaveInterval: number): AnyAction {
     };
 }
 
-export function changeAAMZoomMargin(aamZoomMargin: number): AnyAction {
+export function changeFocusedObjectPadding(focusedObjectPadding: number): AnyAction {
     return {
-        type: SettingsActionTypes.CHANGE_AAM_ZOOM_MARGIN,
+        type: SettingsActionTypes.CHANGE_FOCUSED_OBJECT_PADDING,
         payload: {
-            aamZoomMargin,
+            focusedObjectPadding,
         },
     };
 }
@@ -328,6 +329,15 @@ export function switchAutomaticBordering(automaticBordering: boolean): AnyAction
         type: SettingsActionTypes.SWITCH_AUTOMATIC_BORDERING,
         payload: {
             automaticBordering,
+        },
+    };
+}
+
+export function switchSnapToPoint(snapToPoint: boolean): AnyAction {
+    return {
+        type: SettingsActionTypes.SWITCH_SNAP_TO_POINT,
+        payload: {
+            snapToPoint,
         },
     };
 }
@@ -456,9 +466,9 @@ export function restoreSettingsAsync(): ThunkAction {
 
         Object.entries(_.pick(newSettings, ['player', 'workspace'])).forEach(([sectionKey, section]) => {
             Object.keys(section).forEach((key) => {
-                const settedValue = loadedSettings[sectionKey]?.[key];
-                if (settedValue !== undefined) {
-                    Object.defineProperty(newSettings[sectionKey as 'player' | 'workspace'], key, { value: settedValue });
+                const setValue = loadedSettings[sectionKey]?.[key];
+                if (setValue !== undefined) {
+                    Object.defineProperty(newSettings[sectionKey as 'player' | 'workspace'], key, { value: setValue });
                 }
             });
         });

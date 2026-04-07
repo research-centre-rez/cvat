@@ -76,9 +76,8 @@ context('Review pipeline feature', () => {
 
     after(() => {
         cy.logout();
-        cy.getAuthKey().then((response) => {
-            const authKey = response.body.key;
-            cy.deleteUsers(response, [
+        cy.task('getAuthHeaders').then((authHeaders) => {
+            cy.deleteUsers(authHeaders, [
                 additionalUsers.annotator.username,
                 additionalUsers.reviewer.username,
             ]);
@@ -87,9 +86,7 @@ context('Review pipeline feature', () => {
                 cy.request({
                     method: 'DELETE',
                     url: `/api/tasks/${taskID}`,
-                    headers: {
-                        Authorization: `Token ${authKey}`,
-                    },
+                    headers: authHeaders,
                 });
             }
         });
@@ -108,7 +105,7 @@ context('Review pipeline feature', () => {
                 cy.logout();
             }
 
-            // Requester logins and assignes annotator, then logouts
+            // Requester logins and assigns annotator, then logouts
             cy.login();
             cy.openTask(taskSpec.name);
             cy.assignJobToUser(jobIDs[0], additionalUsers.annotator.username);
@@ -132,7 +129,7 @@ context('Review pipeline feature', () => {
             }
             cy.saveJob();
 
-            // Annotator updates job state, both times update is successfull, logout
+            // Annotator updates job state, both times update is successful, logout
             // check: https://github.com/cvat-ai/cvat/pull/7158
             cy.intercept('PATCH', `/api/jobs/${jobIDs[0]}`).as('updateJobState');
             cy.updateJobStateOnAnnotationView('completed');
@@ -141,7 +138,7 @@ context('Review pipeline feature', () => {
             cy.wait('@updateJobState').its('response.statusCode').should('equal', 200);
             cy.logout();
 
-            // Requester logins and assignes a reviewer
+            // Requester logins and assigns a reviewer
             cy.login();
             cy.openTask(taskSpec.name);
             cy.get('.cvat-job-item').first().within(() => {
@@ -185,7 +182,7 @@ context('Review pipeline feature', () => {
         it('Review pipeline, part 2', () => {
             // this is the same test, but Cypress can't handle too many commands
             // in one test, sometimes raising out of memory exception
-            // this test is devided artifically into two parts
+            // this test is divided artificially into two parts
             // https://github.com/cypress-io/cypress/issues/27415
 
             const countIssuesByFrame = [[0, 1, 'Wrong position'], [1, 1, customIssueDescription], [2, 1, customIssueDescription]];
@@ -232,7 +229,7 @@ context('Review pipeline feature', () => {
             cy.updateJobStateOnAnnotationView('rejected');
             cy.logout();
 
-            // Requester logins and assignes the job to the annotator, sets job stage to annotation
+            // Requester logins and assigns the job to the annotator, sets job stage to annotation
             cy.login();
             cy.get('.cvat-tasks-page').should('exist').and('be.visible');
             cy.openTask(taskSpec.name);

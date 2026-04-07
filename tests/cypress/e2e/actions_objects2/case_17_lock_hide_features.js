@@ -95,9 +95,11 @@ context('Lock/hide features.', () => {
     let shapeWidth = 0;
 
     before(() => {
+        cy.prepareUserSession();
         cy.openTask(taskName);
         [newLabelName1, newLabelName2, newLabelName3, newLabelName4].forEach((name) => {
             cy.addNewLabel({ name });
+            // TODO: probably can be done headlessly?
         });
         cy.openJob();
     });
@@ -179,7 +181,7 @@ context('Lock/hide features.', () => {
                 cy.get('.cvat-object-item-button-pinned').click();
             });
             cy.get('#cvat_canvas_shape_6').should('not.have.class', 'cvat_canvas_shape_draggable');
-            // Get cuttent values for "width" parameter.
+            // Get current values for "width" parameter.
             cy.get('#cvat_canvas_shape_6')
                 .should('have.attr', 'width')
                 .then(($shapeWidth) => {
